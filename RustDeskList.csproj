@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Product>RustDeskList</Product>
+    <ApplicationIcon>Assets\RustDeskList.ico</ApplicationIcon>
+    <Version>1.0.0</Version>
+    <Authors>Alexandr Gedz</Authors>
+    <Company>Alexandr Gedz</Company>
+    <Copyright>© 2026 Alexandr Gedz</Copyright>
+    <Description>Перенос локального списка ПК RustDesk</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="$(ApplicationIcon)" LogicalName="RustDeskList.AppIcon" />
+    <PackageReference Include="System.Management" Version="10.0.14" />
+    <PackageReference Include="Tomlyn" Version="2.10.1" />
+  </ItemGroup>
+</Project>
