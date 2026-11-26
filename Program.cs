@@ -3,8 +3,14 @@ namespace RustDeskList;
 internal static class Program
 {
     [STAThread]
-    private static void Main()
+    private static void Main(string[] args)
     {
+        if (args is [RustDeskServicePause.HelperArgument, var token])
+        {
+            RustDeskServicePause.HoldServiceAsync(token).GetAwaiter().GetResult();
+            return;
+        }
+
         ApplicationConfiguration.Initialize();
 
         string roaming = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);

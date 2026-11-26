@@ -167,7 +167,7 @@ internal sealed class RustDeskProfile(string directory, string workingDirectory)
         return new ImportPlan(added, updated, addedToFavorites, changes);
     }
 
-    public FileStream LockImport()
+    public FileStream LockOperation()
     {
         Directory.CreateDirectory(workingDirectory);
         try
@@ -177,7 +177,7 @@ internal sealed class RustDeskProfile(string directory, string workingDirectory)
         }
         catch (IOException ex) when ((ex.HResult & 0xFFFF) is 32 or 33)
         {
-            throw new IOException("Дождитесь завершения импорта в другом окне утилиты.", ex);
+            throw new IOException("Дождитесь завершения экспорта или импорта в другом окне утилиты.", ex);
         }
     }
 

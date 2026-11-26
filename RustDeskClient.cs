@@ -8,10 +8,9 @@ namespace RustDeskList;
 
 internal sealed class RustDeskClient
 {
-    private static readonly HashSet<string> BackgroundModes = new(StringComparer.OrdinalIgnoreCase)
+    private static readonly HashSet<string> SessionModes = new(StringComparer.OrdinalIgnoreCase)
     {
-        "--service", "--server", "--tray", "--cm", "--cm-no-ui", "--portable-service",
-        "--run-as-system", "--elevate", "--get-id", "--get-uuid", "--version", "--hwcodec-config",
+        "--server", "--tray", "--cm", "--cm-no-ui", "--portable-service",
     };
     private static readonly HashSet<string> InteractiveModes = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -19,11 +18,66 @@ internal sealed class RustDeskClient
         "--terminal", "--terminal-admin", "--play", "--no-server",
     };
 
-    private string? restartPath;
+    public string? RestoreWarning { get; private set; }
 
-    public async Task CloseAsync()
+    public static bool IsRunning()
     {
-        foreach (ClientProcess client in FindClients())
+        Process[] processes = Process.GetProcessesByName("rustdesk");
+        try
+        {
+            return processes.Length > 0 || RustDeskServicePause.IsActive();
+        }
+        finally
+        {
+            foreach (Process process in processes)
+            {
+                process.Dispose();
+            }
+        }
+    }
+
+    public async Task<T> RunClosedAsync<T>(Func<Action, T> operation, bool allowClose)
+    {
+        var (users, systemIds) = InspectProcesses();
+        if (!allowClose && (users.Count != 0 || systemIds.Count != 0 || RustDeskServicePause.IsActive()))
+        {
+            throw new InvalidOperationException("RustDesk запустился перед операцией. Повторите её и подтвердите закрытие.");
+        }
+
+        ClientProcess? restart = users.Find(client => client.Kind == ClientKind.Window)
+            ?? users.Find(client => client.Kind == ClientKind.Tray)
+            ?? users.Find(client => client.Kind == ClientKind.Server);
+        var service = allowClose ? await RustDeskServicePause.BeginAsync() : null;
+        try
+        {
+            await WaitForSystemProcessesAsync(systemIds);
+            if (allowClose)
+            {
+                var (clients, _) = InspectProcesses();
+                await CloseClientsAsync(clients);
+            }
+
+            EnsureClosed();
+            return operation(EnsureClosed);
+        }
+        finally
+        {
+            if (service is not null)
+            {
+                await service.DisposeAsync();
+                RestoreWarning = service.RestoreWarning;
+            }
+
+            if (restart is not null && TryRestart(restart) is { } warning)
+            {
+                RestoreWarning = RestoreWarning is null ? warning : $"{RestoreWarning}\n{warning}";
+            }
+        }
+    }
+
+    private static async Task CloseClientsAsync(List<ClientProcess> clients)
+    {
+        foreach (ClientProcess client in clients)
         {
             Process process;
             try
@@ -63,8 +117,6 @@ internal sealed class RustDeskClient
                         process.Kill();
                         await process.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(5));
                     }
-
-                    restartPath ??= client.Path;
                 }
                 catch (InvalidOperationException) when (process.HasExited)
                 {
@@ -76,36 +128,78 @@ internal sealed class RustDeskClient
                 }
                 catch (Exception ex) when (ex is Win32Exception or TimeoutException)
                 {
-                    throw new InvalidOperationException("Не удалось закрыть клиент RustDesk. Завершите его и повторите импорт.", ex);
+                    throw new InvalidOperationException("Не удалось закрыть процесс RustDesk. Завершите его и повторите операцию.", ex);
                 }
             }
         }
     }
 
-    public void EnsureClosed()
+    private static async Task WaitForSystemProcessesAsync(HashSet<uint> systemIds)
     {
-        if (FindClients().Count != 0)
+        var elapsed = Stopwatch.StartNew();
+        while (HasSystemProcesses(systemIds))
         {
-            throw new InvalidOperationException("Клиент RustDesk снова запущен. Повторите импорт после закрытия клиента.");
+            if (elapsed.Elapsed >= TimeSpan.FromSeconds(8))
+            {
+                throw new InvalidOperationException("Фоновые процессы службы RustDesk не завершились. Повторите операцию.");
+            }
+
+            await Task.Delay(250);
         }
     }
 
-    public string? TryRestart()
+    private static bool HasSystemProcesses(HashSet<uint> ids)
     {
-        if (restartPath is not { } path)
+        if (ids.Count == 0)
         {
-            return null;
+            return false;
         }
 
+        Process[] processes = Process.GetProcessesByName("rustdesk");
         try
         {
-            if (FindClients().Count == 0)
+            return processes.Any(process => ids.Contains((uint)process.Id));
+        }
+        finally
+        {
+            foreach (Process process in processes)
             {
-                using var launched = Process.Start(new ProcessStartInfo(path)
+                process.Dispose();
+            }
+        }
+    }
+
+    private static void EnsureClosed()
+    {
+        var (users, systems) = InspectProcesses();
+        if (users.Count != 0 || systems.Count != 0 || RustDeskServicePause.IsActive())
+        {
+            throw new InvalidOperationException("RustDesk снова запущен. Повторите операцию после закрытия клиента.");
+        }
+    }
+
+    private static string? TryRestart(ClientProcess restart)
+    {
+        try
+        {
+            var (clients, _) = InspectProcesses();
+            if (!clients.Exists(client => client.Kind == restart.Kind))
+            {
+                var start = new ProcessStartInfo(restart.Path)
                 {
-                    WorkingDirectory = Path.GetDirectoryName(path)!,
+                    WorkingDirectory = Path.GetDirectoryName(restart.Path)!,
                     UseShellExecute = true,
-                });
+                };
+                if (restart.Kind == ClientKind.Tray)
+                {
+                    start.ArgumentList.Add("--tray");
+                }
+                else if (restart.Kind == ClientKind.Server)
+                {
+                    start.ArgumentList.Add("--server");
+                }
+
+                using var launched = Process.Start(start);
             }
 
             return null;
@@ -117,7 +211,7 @@ internal sealed class RustDeskClient
         }
     }
 
-    private static List<ClientProcess> FindClients()
+    private static (List<ClientProcess> Clients, HashSet<uint> SystemIds) InspectProcesses()
     {
         using var current = Process.GetCurrentProcess();
         using var identity = WindowsIdentity.GetCurrent();
@@ -126,7 +220,7 @@ internal sealed class RustDeskClient
         using var searcher = new ManagementObjectSearcher(
             "SELECT ProcessId, ParentProcessId, SessionId, CommandLine, ExecutablePath " +
             "FROM Win32_Process WHERE Name = 'rustdesk.exe'");
-        var serviceIds = new HashSet<uint>();
+        var systemIds = new HashSet<uint>();
         var candidates = new List<ManagementObject>();
         try
         {
@@ -135,7 +229,7 @@ internal sealed class RustDeskClient
             {
                 if ((uint)process["SessionId"] == 0)
                 {
-                    serviceIds.Add((uint)process["ProcessId"]);
+                    systemIds.Add((uint)process["ProcessId"]);
                     process.Dispose();
                 }
                 else
@@ -144,38 +238,61 @@ internal sealed class RustDeskClient
                 }
             }
 
+            // The installed service starts a SYSTEM-owned worker in an interactive session.
+            bool addedWorker;
+            do
+            {
+                addedWorker = false;
+                foreach (ManagementObject process in candidates)
+                {
+                    if (systemIds.Contains((uint)process["ParentProcessId"]))
+                    {
+                        addedWorker |= systemIds.Add((uint)process["ProcessId"]);
+                    }
+                }
+            }
+            while (addedWorker);
+
             var clients = new List<ClientProcess>();
             foreach (ManagementObject process in candidates)
             {
+                uint processId = (uint)process["ProcessId"];
+                if (systemIds.Contains(processId))
+                {
+                    continue;
+                }
+
                 var commandLine = (string?)process["CommandLine"];
                 var path = (string?)process["ExecutablePath"];
                 bool currentSession = (uint)process["SessionId"] == current.SessionId;
                 if (string.IsNullOrEmpty(commandLine) || string.IsNullOrEmpty(path))
                 {
-                    // The installed service creates a SYSTEM-owned --server in the user's session.
-                    if (currentSession && !serviceIds.Contains((uint)process["ParentProcessId"]))
+                    if (currentSession)
                     {
                         throw new InvalidOperationException(
-                            "Не удалось определить тип запущенного процесса RustDesk. Закройте клиент, запущенный с повышенными правами, и повторите импорт.");
+                            "Не удалось проверить процесс RustDesk. Закройте клиент, запущенный с повышенными правами, и повторите операцию.");
                     }
 
                     continue;
                 }
 
-                string? argument = GetFirstArgument(commandLine);
-                if (argument is not null && BackgroundModes.Contains(argument))
+                using var processInstance = new ManagementObject(FormattableString.Invariant($"Win32_Process.Handle='{processId}'"));
+                ManagementBaseObject? ownerResult;
+                try
+                {
+                    ownerResult = processInstance.InvokeMethod("GetOwnerSid", null, null);
+                }
+                catch (ManagementException ex) when (ex.ErrorCode == ManagementStatus.NotFound)
                 {
                     continue;
                 }
 
-                uint processId = (uint)process["ProcessId"];
-                using var processInstance = new ManagementObject(FormattableString.Invariant($"Win32_Process.Handle='{processId}'"));
-                using var owner = processInstance.InvokeMethod("GetOwnerSid", null, null);
+                using var owner = ownerResult;
                 if ((uint?)owner?["ReturnValue"] != 0)
                 {
                     if (currentSession)
                     {
-                        throw new InvalidOperationException("Не удалось определить владельца процесса RustDesk. Закройте клиент и повторите импорт.");
+                        throw new InvalidOperationException("Не удалось определить владельца процесса RustDesk. Закройте клиент и повторите операцию.");
                     }
 
                     continue;
@@ -188,12 +305,14 @@ internal sealed class RustDeskClient
 
                 if (!currentSession)
                 {
-                    throw new InvalidOperationException("Закройте клиент RustDesk в другом сеансе Windows и повторите импорт.");
+                    throw new InvalidOperationException("Закройте клиент RustDesk в другом сеансе Windows и повторите операцию.");
                 }
 
-                if (argument is not null && argument.StartsWith('-') && !InteractiveModes.Contains(argument))
+                string? argument = GetFirstArgument(commandLine);
+                bool background = argument is not null && SessionModes.Contains(argument);
+                if (!background && argument is not null && argument.StartsWith('-') && !InteractiveModes.Contains(argument))
                 {
-                    throw new InvalidOperationException("Дождитесь завершения другой операции RustDesk и повторите импорт.");
+                    throw new InvalidOperationException("Дождитесь завершения другой операции RustDesk и повторите.");
                 }
 
                 if (!string.Equals(FileVersionInfo.GetVersionInfo(path).ProductName, "RustDesk", StringComparison.OrdinalIgnoreCase))
@@ -201,10 +320,16 @@ internal sealed class RustDeskClient
                     throw new InvalidOperationException("Не удалось подтвердить, что запущенный RustDesk.exe относится к клиенту RustDesk.");
                 }
 
-                clients.Add(new ClientProcess(checked((int)processId), path));
+                ClientKind kind = background ? argument!.ToLowerInvariant() switch
+                {
+                    "--tray" => ClientKind.Tray,
+                    "--server" => ClientKind.Server,
+                    _ => ClientKind.Helper,
+                } : ClientKind.Window;
+                clients.Add(new ClientProcess(checked((int)processId), path, kind));
             }
 
-            return clients;
+            return (clients, systemIds);
         }
         catch (ManagementException ex)
         {
@@ -243,5 +368,13 @@ internal sealed class RustDeskClient
     [DllImport("kernel32.dll")]
     private static extern nint LocalFree(nint memory);
 
-    private sealed record ClientProcess(int Id, string Path);
+    private enum ClientKind
+    {
+        Window,
+        Tray,
+        Server,
+        Helper,
+    }
+
+    private sealed record ClientProcess(int Id, string Path, ClientKind Kind);
 }

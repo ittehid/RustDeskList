@@ -16,6 +16,18 @@ internal sealed record Contact
     public DateTimeOffset? ModifiedUtc { get; init; }
 }
 
+[Flags]
+internal enum ContactFields
+{
+    Alias = 1,
+    Hostname = 2,
+    Username = 4,
+    Platform = 8,
+    Favorite = 16,
+    ModifiedUtc = 32,
+    All = Alias | Hostname | Username | Platform | Favorite | ModifiedUtc,
+}
+
 internal static class ContactFile
 {
     private const string Format = "rustdesk-contacts";
@@ -100,6 +112,59 @@ internal static class ContactFile
             FileChanges.DeleteTemporary(temporary);
         }
     }
+
+    public static Contact[] Merge(Contact[] first, Contact[] second, ContactFields fields)
+    {
+        var contacts = new Dictionary<string, Contact>(StringComparer.OrdinalIgnoreCase);
+        foreach (Contact contact in first.Concat(second))
+        {
+            if (!PeerId.TryGetFileName(contact.Id, out string fileName))
+            {
+                throw new InvalidDataException($"ID «{contact.Id}» не поддерживается в профиле RustDesk.");
+            }
+
+            if (!contacts.TryGetValue(fileName, out Contact? existing))
+            {
+                contacts.Add(fileName, contact);
+                continue;
+            }
+
+            if (existing.Id != contact.Id)
+            {
+                throw new InvalidDataException(
+                    $"ID «{existing.Id}» и «{contact.Id}» соответствуют одному имени файла RustDesk в Windows.");
+            }
+
+            (Contact newer, Contact older) = Nullable.Compare(existing.ModifiedUtc, contact.ModifiedUtc) >= 0
+                ? (existing, contact)
+                : (contact, existing);
+            contacts[fileName] = newer with
+            {
+                Alias = PreferText(newer.Alias, older.Alias),
+                Hostname = PreferText(newer.Hostname, older.Hostname),
+                Username = PreferText(newer.Username, older.Username),
+                Platform = PreferText(newer.Platform, older.Platform),
+                Favorite = newer.Favorite || older.Favorite,
+            };
+        }
+
+        return contacts.Values
+            .OrderByDescending(contact => contact.ModifiedUtc)
+            .ThenBy(contact => contact.Id, StringComparer.Ordinal)
+            .Select(contact => contact with
+            {
+                Alias = fields.HasFlag(ContactFields.Alias) ? contact.Alias : "",
+                Hostname = fields.HasFlag(ContactFields.Hostname) ? contact.Hostname : "",
+                Username = fields.HasFlag(ContactFields.Username) ? contact.Username : "",
+                Platform = fields.HasFlag(ContactFields.Platform) ? contact.Platform : "",
+                Favorite = fields.HasFlag(ContactFields.Favorite) && contact.Favorite,
+                ModifiedUtc = fields.HasFlag(ContactFields.ModifiedUtc) ? contact.ModifiedUtc : null,
+            })
+            .ToArray();
+    }
+
+    private static string PreferText(string preferred, string fallback) =>
+        preferred.Length == 0 ? fallback : preferred;
 
     private sealed record BackupDocument(string Format, int Version, Contact[] Contacts);
 }

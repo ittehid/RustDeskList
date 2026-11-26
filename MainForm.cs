@@ -5,6 +5,11 @@ namespace RustDeskList;
 
 internal sealed class MainForm : Form
 {
+    private const string ContactFileFilter = "Контакты RustDesk (*.json)|*.json";
+    private const string RustDeskCloseNotice =
+        "Утилита закроет RustDesk вместе с запущенной службой Windows и запустит их снова после операции. " +
+        "Активные входящие и исходящие подключения завершатся. " +
+        "Для остановки службы Windows может запросить права администратора.";
     private static readonly Color Background = Color.FromArgb(243, 246, 251);
     private static readonly Color Ink = Color.FromArgb(23, 37, 60);
     private static readonly Color Muted = Color.FromArgb(72, 89, 113);
@@ -20,6 +25,7 @@ internal sealed class MainForm : Form
         Width = 260,
     };
     private readonly Button refreshButton = CreateButton("&Обновить");
+    private readonly Button mergeButton = CreateButton("Объ&единить…");
     private readonly Button exportButton = CreateButton("&Экспорт…");
     private readonly Button importButton = CreateButton("&Импорт…", primary: true);
     private readonly DataGridView grid = CreateGrid();
@@ -83,6 +89,7 @@ internal sealed class MainForm : Form
         search.TextChanged += (_, _) => RenderContacts();
         Shown += async (_, _) => await RunAsync(RefreshAsync);
         refreshButton.Click += async (_, _) => await RunAsync(RefreshAsync);
+        mergeButton.Click += async (_, _) => await RunAsync(MergeAsync);
         exportButton.Click += async (_, _) => await RunAsync(ExportAsync);
         importButton.Click += async (_, _) => await RunAsync(ImportAsync);
         aboutLink.LinkClicked += (_, _) => ShowAbout();
@@ -177,7 +184,7 @@ internal sealed class MainForm : Form
 
         var toolbar = CreateTwoColumnRow();
         toolbar.Margin = new Padding(0, 0, 0, 12);
-        search.Anchor = AnchorStyles.Left;
+        search.Anchor = AnchorStyles.Left | AnchorStyles.Right;
         search.Margin = Padding.Empty;
         toolbar.Controls.Add(search, 0, 0);
 
@@ -189,7 +196,7 @@ internal sealed class MainForm : Form
             Margin = Padding.Empty,
             Anchor = AnchorStyles.Right,
         };
-        actions.Controls.AddRange([refreshButton, exportButton, importButton]);
+        actions.Controls.AddRange([refreshButton, mergeButton, exportButton, importButton]);
         toolbar.Controls.Add(actions, 1, 0);
         layout.Controls.Add(toolbar, 0, 1);
 
@@ -374,40 +381,38 @@ internal sealed class MainForm : Form
 
     private async Task ExportAsync()
     {
-        using var picker = new SaveFileDialog
-        {
-            Title = "Экспорт контактов RustDesk",
-            Filter = "Контакты RustDesk (*.json)|*.json",
-            FileName = $"RustDeskList-{DateTime.Today:yyyy-MM-dd}.json",
-            DefaultExt = "json",
-            AddExtension = true,
-            OverwritePrompt = true,
-        };
+        using var picker = CreateSaveDialog("Экспорт контактов RustDesk", "RustDeskList");
         if (picker.ShowDialog(this) != DialogResult.OK)
         {
             return;
         }
 
+        bool closeRustDesk = await Task.Run(RustDeskClient.IsRunning);
+        if (closeRustDesk && MessageBox.Show(this, $"{RustDeskCloseNotice}\n\nЭкспортировать контакты?",
+                "Подтверждение экспорта", MessageBoxButtons.YesNo, MessageBoxIcon.Question,
+                MessageBoxDefaultButton.Button2) != DialogResult.Yes)
+        {
+            SetStatus("Экспорт отменён.");
+            return;
+        }
+
         SetStatus("Экспорт контактов…");
-        snapshot = await Task.Run(() =>
+        string target = picker.FileName;
+        snapshot = await RunProfileOperationAsync(client => client.RunClosedAsync(ensureClosed =>
         {
             ContactSnapshot current = profile.ReadContacts();
-            ContactFile.Save(picker.FileName, current.Contacts);
+            ensureClosed();
+            ContactFile.Save(target, current.Contacts);
             return current;
-        });
+        }, closeRustDesk));
         RenderContacts();
         string skipped = snapshot.Skipped == 0 ? "" : $" Пропущено записей — {snapshot.Skipped}.";
-        SetStatus($"Экспортировано {snapshot.Contacts.Length} ПК в {Path.GetFileName(picker.FileName)}.{skipped}");
+        SetStatus($"Экспортировано {snapshot.Contacts.Length} ПК в {Path.GetFileName(target)}.{skipped}");
     }
 
     private async Task ImportAsync()
     {
-        using var picker = new OpenFileDialog
-        {
-            Title = "Импорт контактов RustDesk",
-            Filter = "Контакты RustDesk (*.json)|*.json",
-            CheckFileExists = true,
-        };
+        using var picker = CreateOpenDialog("Импорт контактов RustDesk");
         if (picker.ShowDialog(this) != DialogResult.OK)
         {
             return;
@@ -430,8 +435,8 @@ internal sealed class MainForm : Form
             $"Новых ПК — {preview.Added}\n" +
             $"ПК с заполнением пустых полей — {preview.Updated}\n" +
             $"Добавлений в избранное — {preview.AddedToFavorites}\n\n" +
-            "Утилита сделает резервную копию изменяемых файлов. " +
-            "Если клиент RustDesk открыт, он будет перезапущен. Исходящие подключения завершатся.\n\n" +
+            "Утилита сделает резервную копию изменяемых файлов.\n\n" +
+            $"{RustDeskCloseNotice}\n\n" +
             "Импортировать контакты?",
             "Подтверждение импорта", MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2);
         if (decision != DialogResult.Yes)
@@ -441,40 +446,20 @@ internal sealed class MainForm : Form
         }
 
         SetStatus("Импорт контактов…");
-        string? restartWarning = null;
-        string? backup;
-        ImportPlan applied;
-        try
+        var (applied, backup) = await RunProfileOperationAsync(async client =>
         {
-            (applied, backup) = await Task.Run(async () =>
+            ImportPlan current = profile.PlanImport(contacts);
+            if (current.Changes.Count == 0)
             {
-                using var importLock = profile.LockImport();
-                var client = new RustDeskClient();
-                try
-                {
-                    ImportPlan plan = profile.PlanImport(contacts);
-                    if (plan.Changes.Count == 0)
-                    {
-                        return (plan, null);
-                    }
-
-                    await client.CloseAsync();
-                    plan = profile.PlanImport(contacts);
-                    return (plan, profile.Apply(plan, client.EnsureClosed));
-                }
-                finally
-                {
-                    restartWarning = client.TryRestart();
-                }
-            });
-        }
-        finally
-        {
-            if (restartWarning is not null)
-            {
-                MessageBox.Show(this, restartWarning, "Запуск RustDesk", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return (current, (string?)null);
             }
-        }
+
+            return await client.RunClosedAsync(ensureClosed =>
+            {
+                ImportPlan plan = profile.PlanImport(contacts);
+                return (plan, profile.Apply(plan, ensureClosed));
+            }, allowClose: true);
+        });
 
         if (backup is not null)
         {
@@ -489,6 +474,94 @@ internal sealed class MainForm : Form
         snapshot = await Task.Run(profile.ReadContacts);
         RenderContacts();
     }
+
+    private async Task<T> RunProfileOperationAsync<T>(Func<RustDeskClient, Task<T>> operation)
+    {
+        var client = new RustDeskClient();
+        try
+        {
+            return await Task.Run(async () =>
+            {
+                using var operationLock = profile.LockOperation();
+                return await operation(client);
+            });
+        }
+        finally
+        {
+            if (client.RestoreWarning is { } warning)
+            {
+                MessageBox.Show(this, warning, "Запуск RustDesk", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+        }
+    }
+
+    private async Task MergeAsync()
+    {
+        using var firstPicker = CreateOpenDialog("Первый файл контактов");
+        if (firstPicker.ShowDialog(this) != DialogResult.OK)
+        {
+            return;
+        }
+
+        using var secondPicker = CreateOpenDialog("Второй файл контактов");
+        if (secondPicker.ShowDialog(this) != DialogResult.OK)
+        {
+            return;
+        }
+
+        string firstPath = Path.GetFullPath(firstPicker.FileName);
+        string secondPath = Path.GetFullPath(secondPicker.FileName);
+        if (string.Equals(firstPath, secondPath, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidDataException("Выберите два разных JSON-файла.");
+        }
+
+        SetStatus("Чтение файлов контактов…");
+        var (first, second) = await Task.Run(() => (ContactFile.Load(firstPath), ContactFile.Load(secondPath)));
+        using var choices = new MergeDialog(firstPath, first, secondPath, second) { Icon = Icon };
+        if (choices.ShowDialog(this) != DialogResult.OK)
+        {
+            SetStatus("Объединение отменено.");
+            return;
+        }
+
+        var (selectedFirst, selectedSecond, fields) = choices.ReadSelection();
+        var merged = await Task.Run(() => ContactFile.Merge(selectedFirst, selectedSecond, fields));
+        int repeated = selectedFirst.Length + selectedSecond.Length - merged.Length;
+        using var destination = CreateSaveDialog($"Сохранить общий список ({merged.Length} ПК)", "RustDeskList-объединённый");
+        if (destination.ShowDialog(this) != DialogResult.OK)
+        {
+            SetStatus("Объединение отменено.");
+            return;
+        }
+
+        string target = Path.GetFullPath(destination.FileName);
+        if (string.Equals(target, firstPath, StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(target, secondPath, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidDataException("Укажите новое имя для общего списка.");
+        }
+
+        await Task.Run(() => ContactFile.Save(target, merged));
+        SetStatus($"Сохранено {merged.Length} ПК в {Path.GetFileName(target)}. Совпавших ID — {repeated}.");
+    }
+
+    private static OpenFileDialog CreateOpenDialog(string title) => new()
+    {
+        Title = title,
+        Filter = ContactFileFilter,
+        CheckFileExists = true,
+    };
+
+    private static SaveFileDialog CreateSaveDialog(string title, string prefix) => new()
+    {
+        Title = title,
+        Filter = ContactFileFilter,
+        FileName = $"{prefix}-{DateTime.Today:yyyy-MM-dd}.json",
+        DefaultExt = "json",
+        AddExtension = true,
+        OverwritePrompt = true,
+    };
 
     private async Task RunAsync(Func<Task> action)
     {
@@ -513,6 +586,7 @@ internal sealed class MainForm : Form
     {
         busy = value;
         refreshButton.Enabled = !value;
+        mergeButton.Enabled = !value;
         importButton.Enabled = !value;
         exportButton.Enabled = !value && snapshot.Contacts.Length > 0;
         backupLink.Enabled = !value;
